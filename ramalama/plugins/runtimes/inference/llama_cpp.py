@@ -725,7 +725,7 @@ class LlamaCppPlugin(LlamaCppCommands, ContainerizedInferenceRuntimePlugin):
             nvidia.com/gpu: 1"""
 
         if cmd_args_rest:
-            args_yaml = f'\n        args: [{", ".join(repr(a) for a in cmd_args_rest)}]'
+            args_yaml = "\n        args: [" + ", ".join(repr(a) for a in cmd_args_rest) + "]"
         else:
             args_yaml = ""
 
