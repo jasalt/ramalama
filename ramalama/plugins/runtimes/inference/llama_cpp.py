@@ -701,33 +701,34 @@ class LlamaCppPlugin(LlamaCppCommands, ContainerizedInferenceRuntimePlugin):
         port = getattr(args, "port", None)
         port_str = ""
         if port:
-            port_str = f"""\
+            port_str = f"""
         ports:
         - containerPort: {port}"""
 
         # Build env string
-        env_str = ""
+        env_items = ""
         for k, v in get_accel_env_vars().items():
-            env_str += f"\n        - name: {k}\n          value: \"{v}\""
+            env_items += f"\n        - name: {k}\n          value: \"{v}\""
         for e in getattr(args, "env", None) or []:
             kv = e.split("=", 1)
             if len(kv) == 2:
-                env_str += f"\n        - name: {kv[0]}\n          value: \"{kv[1]}\""
+                env_items += f"\n        - name: {kv[0]}\n          value: \"{kv[1]}\""
+        env_str = f"\n        env:{env_items}" if env_items else ""
 
         # Build GPU resources
         resources_str = ""
         gpu_keywords = ["cuda", "rocm", "gpu"]
         image_lower = getattr(args, "image", "").lower()
         if any(keyword in image_lower for keyword in gpu_keywords):
-            resources_str = """\
+            resources_str = """
         resources:
           limits:
             nvidia.com/gpu: 1"""
 
         if cmd_args_rest:
-            args_yaml = "\n        args: [" + ", ".join(repr(a) for a in cmd_args_rest) + "]"
+            args_yaml = "[" + ", ".join(repr(a) for a in cmd_args_rest) + "]"
         else:
-            args_yaml = ""
+            args_yaml = "[]"
 
         content = f"""\
 # Save the output of this file and use kubectl create -f to import
