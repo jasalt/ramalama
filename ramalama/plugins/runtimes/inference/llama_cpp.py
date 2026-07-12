@@ -34,10 +34,15 @@ from ramalama.cli import (
     runtime_options,
     suppressCompleter,
 )
+from ramalama.compose import genfile as compose_genfile
 from ramalama.common import (
+    ContainerEntryPoint,
     accel_image,
     ensure_image,
     genname,
+    get_accel,
+    get_accel_env_vars,
+    get_gpu_devices,
     get_gpu_type_env_vars,
     run_cmd,
     set_accel_env_vars,
@@ -46,6 +51,8 @@ from ramalama.common import (
 )
 from ramalama.config import ActiveConfig, DefaultConfig, coerce_to_bool
 from ramalama.engine import Engine, dry_run, image_inspect
+from ramalama.file import UnitFile
+from ramalama.kube import genfile as kube_genfile
 from ramalama.logger import logger
 from ramalama.model_store.constants import DIRECTORY_NAME_BLOBS, DIRECTORY_NAME_REFS, DIRECTORY_NAME_SNAPSHOTS
 from ramalama.model_store.global_store import GlobalModelStore
@@ -501,6 +508,7 @@ class LlamaCppPlugin(LlamaCppCommands, ContainerizedInferenceRuntimePlugin):
         if not args.container:
             sys.exit("Error: multi-model router mode requires a container runtime.")
 
+        generate = getattr(args, "generate", None)
         set_accel_env_vars()
         args.port = compute_serving_port(args)
         args.router_mode = True
@@ -522,10 +530,15 @@ class LlamaCppPlugin(LlamaCppCommands, ContainerizedInferenceRuntimePlugin):
 
         if args.container and not args.dryrun:
             config = ActiveConfig()
-            should_pull = config.pull in ["always", "missing", "newer"]
-            args.image = ensure_image(config.engine, accel_image(config), should_pull=should_pull)
+            should_pull = False if generate else config.pull in ["always", "missing", "newer"]
+            args.image = ensure_image(config.engine, accel_image(config), should_pull=should_pull, quiet=getattr(args, "quiet", False))
 
         cmd = assemble_command(args)
+
+        if generate:
+            self._generate_router_service_config(args, cmd, models)
+            return
+
         engine = Engine(args)
         name = getattr(args, "name", None) or genname()
         engine.add(["--label", "ai.ramalama", "--name", name, "--env=HOME=/tmp", "--init"])
@@ -541,6 +554,299 @@ class LlamaCppPlugin(LlamaCppCommands, ContainerizedInferenceRuntimePlugin):
             engine.dryrun()
             return
         engine.exec()
+
+    def _generate_router_service_config(
+        self, args: argparse.Namespace, cmd: list[str], models: list[tuple[str, str]]
+    ) -> None:
+        """Generate a service definition file for multi-model router mode."""
+        gen_type = args.generate.gen_type
+        output_dir = args.generate.output_dir
+        name = getattr(args, "name", None) or "ramalama-router"
+
+        if gen_type in ("quadlet", "quadlet/kube"):
+            self._gen_router_quadlet(args, cmd, models, name, output_dir)
+        if gen_type in ("kube", "quadlet/kube"):
+            self._gen_router_kube(args, cmd, models, name, output_dir)
+            # Also generate .kube quadlet file for podman kube play
+            if gen_type == "quadlet/kube":
+                kube_file = UnitFile(f"{name}.kube")
+                print(f"Generating quadlet file: {name}.kube")
+                kube_file.add("Unit", "Description", f"RamaLama {name} Kubernetes YAML - AI Model Router Service")
+                kube_file.add("Unit", "After", "local-fs.target")
+                kube_file.add("Kube", "Yaml", f"{name}.yaml")
+                kube_file.add("Install", "WantedBy", "multi-user.target default.target")
+                kube_file.write(output_dir)
+        if gen_type == "compose":
+            self._gen_router_compose(args, cmd, models, name, output_dir)
+
+    def _gen_router_quadlet(
+        self,
+        args: argparse.Namespace,
+        cmd: list[str],
+        models: list[tuple[str, str]],
+        name: str,
+        output_dir: str,
+    ) -> None:
+        import shlex
+
+        container_file_name = f"{name}.container"
+        print(f"Generating quadlet file: {container_file_name}")
+
+        quadlet_file = UnitFile(container_file_name)
+        quadlet_file.add("Unit", "Description", f"RamaLama {name} AI Model Router Service")
+        quadlet_file.add("Unit", "After", "local-fs.target")
+
+        quadlet_file.add("Container", "AddDevice", "-/dev/accel")
+        quadlet_file.add("Container", "AddDevice", "-/dev/dri")
+        quadlet_file.add("Container", "AddDevice", "-/dev/kfd")
+        if get_accel() == "cuda":
+            quadlet_file.add("Container", "AddDevice", "nvidia.com/gpu=all")
+
+        quadlet_file.add("Container", "Image", args.image)
+        quadlet_file.add("Container", "RunInit", "true")
+        quadlet_file.add("Container", "Environment", "HOME=/tmp")
+
+        # Build exec command, stripping ContainerEntryPoint if present
+        cmd_args = cmd
+        if len(cmd_args) > 0 and isinstance(cmd_args[0], ContainerEntryPoint):
+            cmd_args = cmd_args[1:]
+        exec_cmd = shlex.join(cmd_args)
+        quadlet_file.add("Container", "Exec", exec_cmd)
+
+        # Mount each model
+        for host_path, container_name in models:
+            container_host_path = get_container_mount_path(host_path)
+            mount_path = f"/mnt/models/{container_name}"
+            quadlet_file.add(
+                "Container",
+                "Mount",
+                f"type=bind,src={container_host_path},target={mount_path},ro,Z",
+            )
+
+        # Port
+        port = getattr(args, "port", None)
+        if port:
+            host = getattr(args, "host", None) or "::"
+            host = host.strip("[]")
+            host_str = f"[{host}]" if ":" in host else host
+            quadlet_file.add("Container", "PublishPort", f"{host_str}:{port}:{port}")
+
+        # Container name
+        if getattr(args, "name", None):
+            quadlet_file.add("Container", "ContainerName", args.name)
+
+        # Environment variables for GPU acceleration
+        for k, v in get_accel_env_vars().items():
+            quadlet_file.add("Container", "Environment", f"{k}={v}")
+        for e in getattr(args, "env", None) or []:
+            quadlet_file.add("Container", "Environment", str(e))
+
+        # Security settings
+        if getattr(args, "privileged", False):
+            quadlet_file.add("Container", "PodmanArgs", "--privileged")
+        else:
+            quadlet_file.add("Container", "SecurityLabelDisable", "true")
+            if not getattr(args, "nocapdrop", False):
+                quadlet_file.add("Container", "DropCapability", "all")
+                quadlet_file.add("Container", "NoNewPrivileges", "true")
+
+        # User-specified additions via --add-to-unit
+        if add_to_units := getattr(args, "add_to_unit", None):
+            for unit in add_to_units:
+                section, key, value = unit.split(":", 2)
+                quadlet_file.add(section, key, value)
+
+        quadlet_file.add("Install", "WantedBy", "multi-user.target default.target")
+        quadlet_file.write(output_dir)
+
+    def _gen_router_kube(
+        self,
+        args: argparse.Namespace,
+        cmd: list[str],
+        models: list[tuple[str, str]],
+        name: str,
+        output_dir: str,
+    ) -> None:
+        from ramalama.version import version
+
+        _version = version()
+
+        # Build volume mounts for each model
+        mounts_str = ""
+        volumes_str = ""
+        for host_path, container_name in models:
+            container_host_path = get_container_mount_path(host_path)
+            mount_path = f"/mnt/models/{container_name}"
+            safe_name = container_name.replace(".", "-").replace("/", "-")
+            if not mounts_str:
+                mounts_str = "\n        volumeMounts:"
+            mounts_str += (
+                f"\n        - name: {safe_name}\n"
+                f'          mountPath: "{mount_path}"\n'
+                f"          readOnly: true"
+            )
+            volumes_str += (
+                f"\n      - name: {safe_name}\n"
+                f"        hostPath:\n"
+                f'          path: "{container_host_path}"'
+            )
+
+        # Build command string
+        cmd_args = cmd
+        if len(cmd_args) > 0 and isinstance(cmd_args[0], ContainerEntryPoint):
+            cmd_args = cmd_args[1:]
+        command = cmd_args[0] if len(cmd_args) > 0 else ""
+        cmd_args_rest = cmd_args[1:] if len(cmd_args) > 1 else []
+
+        # Build port string
+        port = getattr(args, "port", None)
+        port_str = ""
+        if port:
+            port_str = f"""\
+        ports:
+        - containerPort: {port}"""
+
+        # Build env string
+        env_str = ""
+        for k, v in get_accel_env_vars().items():
+            env_str += f"\n        - name: {k}\n          value: \"{v}\"";
+        for e in getattr(args, "env", None) or []:
+            kv = e.split("=", 1)
+            if len(kv) == 2:
+                env_str += f"\n        - name: {kv[0]}\n          value: \"{kv[1]}\"";
+
+        # Build GPU resources
+        resources_str = ""
+        gpu_keywords = ["cuda", "rocm", "gpu"]
+        image_lower = getattr(args, "image", "").lower()
+        if any(keyword in image_lower for keyword in gpu_keywords):
+            resources_str = """\
+        resources:
+          limits:
+            nvidia.com/gpu: 1"""
+
+        content = f"""\
+# Save the output of this file and use kubectl create -f to import
+# it into Kubernetes.
+#
+# Created with ramalama-{_version}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {name}
+  labels:
+    app: {name}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {name}
+  template:
+    metadata:
+      labels:
+        app: {name}
+    spec:
+      containers:
+      - name: {name}
+        image: {args.image}{env_str}
+        command: ["{command}"]{f'\n        args: [{", ".join(repr(a) for a in cmd_args_rest)}]' if cmd_args_rest else ''}{port_str}{mounts_str}{resources_str}
+      volumes:{volumes_str}
+"""
+
+        file_name = f"{name}.yaml"
+        print(f"Generating Kubernetes YAML file: {file_name}")
+        kube_genfile(name, content).write(output_dir)
+
+    def _gen_router_compose(
+        self,
+        args: argparse.Namespace,
+        cmd: list[str],
+        models: list[tuple[str, str]],
+        name: str,
+        output_dir: str,
+    ) -> None:
+        import shlex
+
+        from ramalama.version import version
+
+        _version = version()
+
+        # Volumes for each model
+        volumes_str = ""
+        for host_path, container_name in models:
+            container_host_path = get_container_mount_path(host_path)
+            mount_path = f"/mnt/models/{container_name}"
+            volumes_str += f'\n      - "{container_host_path}:{mount_path}:ro"'
+
+        # Devices
+        devices = get_gpu_devices()
+        devices_str = ""
+        if devices:
+            devices_str = "    devices:"
+            for dev in devices.values():
+                devices_str += f'\n      - "{dev}:{dev}"'
+
+        # Ports
+        port_arg = getattr(args, "port", None)
+        if port_arg:
+            p = port_arg.split(":", 2) if isinstance(port_arg, str) else [str(port_arg)]
+            host_port = p[1] if len(p) > 1 else p[0]
+            container_port = p[0]
+            ports_str = f'    ports:\n      - "{host_port}:{container_port}"'
+        else:
+            ports_str = '    ports:\n      - "8080:8080"'
+
+        # Environment
+        env_vars = dict(get_accel_env_vars())
+        for e in getattr(args, "env", None) or []:
+            kv = e.split("=", 1)
+            if len(kv) == 2:
+                env_vars[kv[0]] = kv[1]
+        env_str = ""
+        if env_vars:
+            env_str = "    environment:"
+            for k, v in env_vars.items():
+                env_str += f"\n      - {k}={v}"
+
+        # GPU deployment
+        gpu_str = ""
+        gpu_keywords = ["cuda", "rocm", "gpu"]
+        image_lower = getattr(args, "image", "").lower()
+        if any(keyword in image_lower for keyword in gpu_keywords):
+            gpu_str = """\
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]"""
+
+        # Command
+        cmd_args = list(cmd)
+        if len(cmd_args) > 0 and isinstance(cmd_args[0], ContainerEntryPoint):
+            cmd_args = cmd_args[1:]
+        command_str = f"    command: {shlex.join(cmd_args)}" if cmd_args else ""
+
+        content = f"""\
+# Save this output to a 'docker-compose.yaml' file and run 'docker compose up'.
+#
+# Created with ramalama-{_version}
+
+services:
+  {name}:
+    container_name: {name}
+    image: {args.image}
+    volumes:{volumes_str}
+{ports_str}
+{env_str}
+{devices_str}
+{gpu_str}
+{command_str}
+    restart: unless-stopped
+"""
+        content = "\n".join(line for line in content.splitlines() if line.strip())
+        compose_genfile(name, content).write(output_dir)
 
     @staticmethod
     def _migrate_store_ref_files(store: Any) -> None:
