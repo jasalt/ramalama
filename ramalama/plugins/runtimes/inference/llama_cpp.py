@@ -34,7 +34,6 @@ from ramalama.cli import (
     runtime_options,
     suppressCompleter,
 )
-from ramalama.compose import genfile as compose_genfile
 from ramalama.common import (
     ContainerEntryPoint,
     accel_image,
@@ -49,6 +48,7 @@ from ramalama.common import (
     set_gpu_type_env_vars,
     version_tagged_image,
 )
+from ramalama.compose import genfile as compose_genfile
 from ramalama.config import ActiveConfig, DefaultConfig, coerce_to_bool
 from ramalama.engine import Engine, dry_run, image_inspect
 from ramalama.file import UnitFile
@@ -531,7 +531,12 @@ class LlamaCppPlugin(LlamaCppCommands, ContainerizedInferenceRuntimePlugin):
         if args.container and not args.dryrun:
             config = ActiveConfig()
             should_pull = False if generate else config.pull in ["always", "missing", "newer"]
-            args.image = ensure_image(config.engine, accel_image(config), should_pull=should_pull, quiet=getattr(args, "quiet", False))
+            args.image = ensure_image(
+                config.engine,
+                accel_image(config),
+                should_pull=should_pull,
+                quiet=getattr(args, "quiet", False),
+            )
 
         cmd = assemble_command(args)
 
@@ -681,15 +686,9 @@ class LlamaCppPlugin(LlamaCppCommands, ContainerizedInferenceRuntimePlugin):
             if not mounts_str:
                 mounts_str = "\n        volumeMounts:"
             mounts_str += (
-                f"\n        - name: {safe_name}\n"
-                f'          mountPath: "{mount_path}"\n'
-                f"          readOnly: true"
+                f"\n        - name: {safe_name}\n          mountPath: \"{mount_path}\"\n          readOnly: true"
             )
-            volumes_str += (
-                f"\n      - name: {safe_name}\n"
-                f"        hostPath:\n"
-                f'          path: "{container_host_path}"'
-            )
+            volumes_str += f"\n      - name: {safe_name}\n        hostPath:\n          path: \"{container_host_path}\""
 
         # Build command string
         cmd_args = cmd
@@ -709,11 +708,11 @@ class LlamaCppPlugin(LlamaCppCommands, ContainerizedInferenceRuntimePlugin):
         # Build env string
         env_str = ""
         for k, v in get_accel_env_vars().items():
-            env_str += f"\n        - name: {k}\n          value: \"{v}\"";
+            env_str += f"\n        - name: {k}\n          value: \"{v}\""
         for e in getattr(args, "env", None) or []:
             kv = e.split("=", 1)
             if len(kv) == 2:
-                env_str += f"\n        - name: {kv[0]}\n          value: \"{kv[1]}\"";
+                env_str += f"\n        - name: {kv[0]}\n          value: \"{kv[1]}\""
 
         # Build GPU resources
         resources_str = ""
@@ -724,6 +723,11 @@ class LlamaCppPlugin(LlamaCppCommands, ContainerizedInferenceRuntimePlugin):
         resources:
           limits:
             nvidia.com/gpu: 1"""
+
+        if cmd_args_rest:
+            args_yaml = f'\n        args: [{", ".join(repr(a) for a in cmd_args_rest)}]'
+        else:
+            args_yaml = ""
 
         content = f"""\
 # Save the output of this file and use kubectl create -f to import
@@ -749,7 +753,8 @@ spec:
       containers:
       - name: {name}
         image: {args.image}{env_str}
-        command: ["{command}"]{f'\n        args: [{", ".join(repr(a) for a in cmd_args_rest)}]' if cmd_args_rest else ''}{port_str}{mounts_str}{resources_str}
+        command: ["{command}"]
+        args: {args_yaml}{port_str}{mounts_str}{resources_str}
       volumes:{volumes_str}
 """
 
