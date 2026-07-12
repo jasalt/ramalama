@@ -832,7 +832,7 @@ spec:
         cmd_args = list(cmd)
         if len(cmd_args) > 0 and isinstance(cmd_args[0], ContainerEntryPoint):
             cmd_args = cmd_args[1:]
-        command_str = f"    command: {shlex.join(cmd_args)}" if cmd_args else ""
+        command_str = f'    command: "{shlex.join(cmd_args)}"' if cmd_args else ""
 
         content = f"""\
 # Save this output to a 'docker-compose.yaml' file and run 'docker compose up'.
