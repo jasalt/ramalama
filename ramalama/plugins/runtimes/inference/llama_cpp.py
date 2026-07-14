@@ -782,7 +782,7 @@ spec:
         for host_path, container_name in models:
             container_host_path = get_container_mount_path(host_path)
             mount_path = f"/mnt/models/{container_name}"
-            volumes_str += f'\n      - "{container_host_path}:{mount_path}:ro"'
+            volumes_str += f'\n      - "{container_host_path}:{mount_path}:ro,z"'
 
         # Devices
         devices = get_gpu_devices()
