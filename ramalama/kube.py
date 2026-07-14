@@ -162,14 +162,12 @@ class Kube:
             return ""
 
         p = self.args.port.split(":", 2)
-        ports = f"""\
+        container_port = p[0]
+        host_port = p[1] if len(p) > 1 else p[0]
+        return f"""\
         ports:
-        - containerPort: {p[0]}"""
-        if len(p) > 1:
-            ports += f"""
-          hostPort: {p[1]}"""
-
-        return ports
+        - containerPort: {container_port}
+          hostPort: {host_port}"""
 
     def __gen_env_vars(self) -> str:
         env_vars = get_accel_env_vars()

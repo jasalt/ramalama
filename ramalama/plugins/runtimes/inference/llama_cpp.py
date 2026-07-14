@@ -701,9 +701,13 @@ class LlamaCppPlugin(LlamaCppCommands, ContainerizedInferenceRuntimePlugin):
         port = getattr(args, "port", None)
         port_str = ""
         if port:
+            p = str(port).split(":", 2)
+            container_port = p[0]
+            host_port = p[1] if len(p) > 1 else p[0]
             port_str = f"""
         ports:
-        - containerPort: {port}"""
+        - containerPort: {container_port}
+          hostPort: {host_port}"""
 
         # Build env string
         env_items = ""
